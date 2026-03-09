@@ -160,14 +160,11 @@ server.tool(
     const tasksFile = path.join(IPC_DIR, 'current_tasks.json');
 
     try {
-      let raw: string;
-      try {
-        raw = fs.readFileSync(tasksFile, 'utf-8');
-      } catch {
+      if (!fs.existsSync(tasksFile)) {
         return { content: [{ type: 'text' as const, text: 'No scheduled tasks found.' }] };
       }
 
-      const allTasks = JSON.parse(raw);
+      const allTasks = JSON.parse(fs.readFileSync(tasksFile, 'utf-8'));
 
       const tasks = isMain
         ? allTasks

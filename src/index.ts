@@ -47,12 +47,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import {
-  findChannel,
-  formatMessages,
-  formatOutbound,
-  stripInternalTags,
-} from './router.js';
+import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
   isSenderAllowed,
   isTriggerAllowed,
@@ -145,18 +140,22 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
  * Handles collisions by appending -2, -3, etc.
  * Returns null if no valid folder name can be generated.
  */
-export function generateDmFolderName(chatJid: string, contactName?: string): string | null {
+export function generateDmFolderName(
+  chatJid: string,
+  contactName?: string,
+): string | null {
   const usedFolders = new Set(
     Object.values(registeredGroups).map((g) => g.folder),
   );
 
   let base: string | undefined;
   if (contactName) {
-    base = contactName
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 50) || undefined;
+    base =
+      contactName
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 50) || undefined;
   }
 
   if (!base) {
@@ -174,6 +173,7 @@ export function generateDmFolderName(chatJid: string, contactName?: string): str
   let candidate = base;
   let counter = 2;
   while (usedFolders.has(candidate)) {
+    if (counter > 1000) return null;
     candidate = `${base}-${counter}`;
     counter++;
   }
@@ -265,7 +265,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      const text = stripInternalTags(raw);
+      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         await channel.sendMessage(chatJid, text);
@@ -574,7 +575,10 @@ async function main(): Promise<void> {
 
       const folder = generateDmFolderName(chatJid, meta.name);
       if (!folder) {
-        logger.warn({ chatJid, name: meta.name }, 'Could not generate valid folder for DM user');
+        logger.warn(
+          { chatJid, name: meta.name },
+          'Could not generate valid folder for DM user',
+        );
         return false;
       }
 
@@ -597,9 +601,16 @@ async function main(): Promise<void> {
       const globalClaudeMd = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
       const userClaudeMd = path.join(GROUPS_DIR, folder, 'CLAUDE.md');
       try {
-        fs.copyFileSync(globalClaudeMd, userClaudeMd, fs.constants.COPYFILE_EXCL);
-      } catch {
-        // Source missing or destination already exists — both fine
+        fs.copyFileSync(
+          globalClaudeMd,
+          userClaudeMd,
+          fs.constants.COPYFILE_EXCL,
+        );
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'EEXIST') {
+          logger.warn({ err, folder }, 'Failed to copy global CLAUDE.md');
+        }
       }
 
       return true;
