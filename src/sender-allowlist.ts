@@ -20,6 +20,9 @@ const DEFAULT_CONFIG: SenderAllowlistConfig = {
   logDenied: true,
 };
 
+let cachedConfig: SenderAllowlistConfig | null = null;
+let cachedMtime: number = 0;
+
 function isValidEntry(entry: unknown): entry is ChatAllowlistEntry {
   if (!entry || typeof entry !== 'object') return false;
   const e = entry as Record<string, unknown>;
@@ -34,6 +37,18 @@ export function loadSenderAllowlist(
   pathOverride?: string,
 ): SenderAllowlistConfig {
   const filePath = pathOverride ?? SENDER_ALLOWLIST_PATH;
+
+  // Cache by mtime — avoid re-reading and re-parsing on every poll tick
+  if (!pathOverride) {
+    try {
+      const stat = fs.statSync(filePath);
+      const mtime = stat.mtimeMs;
+      if (cachedConfig && mtime === cachedMtime) return cachedConfig;
+      cachedMtime = mtime;
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return DEFAULT_CONFIG;
+    }
+  }
 
   let raw: string;
   try {
@@ -81,11 +96,14 @@ export function loadSenderAllowlist(
     }
   }
 
-  return {
+  const result: SenderAllowlistConfig = {
     default: obj.default as ChatAllowlistEntry,
     chats,
     logDenied: obj.logDenied !== false,
   };
+
+  if (!pathOverride) cachedConfig = result;
+  return result;
 }
 
 function getEntry(

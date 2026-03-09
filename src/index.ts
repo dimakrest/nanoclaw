@@ -47,7 +47,12 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatOutbound,
+  stripInternalTags,
+} from './router.js';
 import {
   isSenderAllowed,
   isTriggerAllowed,
@@ -260,8 +265,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         typeof result.result === 'string'
           ? result.result
           : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+      const text = stripInternalTags(raw);
       logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
       if (text) {
         await channel.sendMessage(chatJid, text);
@@ -593,11 +597,9 @@ async function main(): Promise<void> {
       const globalClaudeMd = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
       const userClaudeMd = path.join(GROUPS_DIR, folder, 'CLAUDE.md');
       try {
-        if (fs.existsSync(globalClaudeMd) && !fs.existsSync(userClaudeMd)) {
-          fs.copyFileSync(globalClaudeMd, userClaudeMd);
-        }
-      } catch (err) {
-        logger.warn({ err, folder }, 'Failed to copy global CLAUDE.md template');
+        fs.copyFileSync(globalClaudeMd, userClaudeMd, fs.constants.COPYFILE_EXCL);
+      } catch {
+        // Source missing or destination already exists — both fine
       }
 
       return true;
