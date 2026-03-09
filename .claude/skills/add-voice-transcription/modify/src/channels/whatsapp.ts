@@ -27,6 +27,7 @@ const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
+  onUnregisteredDm: (chatJid: string, meta: { name?: string; channel?: string }) => boolean;
   registeredGroups: () => Record<string, RegisteredGroup>;
 }
 
@@ -171,8 +172,14 @@ export class WhatsAppChannel implements Channel {
         const isGroup = chatJid.endsWith('@g.us');
         this.opts.onChatMetadata(chatJid, timestamp, undefined, 'whatsapp', isGroup);
 
+        // Auto-register unknown DMs (not groups, not fromMe)
+        let groups = this.opts.registeredGroups();
+        if (!groups[chatJid] && !isGroup && !msg.key.fromMe) {
+          this.opts.onUnregisteredDm(chatJid, { name: msg.pushName, channel: 'whatsapp' });
+          groups = this.opts.registeredGroups();
+        }
+
         // Only deliver full message for registered groups
-        const groups = this.opts.registeredGroups();
         if (groups[chatJid]) {
           const content =
             msg.message?.conversation ||
