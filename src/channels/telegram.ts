@@ -1,7 +1,8 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
-import { Bot } from 'grammy';
+import { Bot, InputFile } from 'grammy';
+import type { Stats } from 'node:fs';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN, GROUPS_DIR } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -22,6 +23,14 @@ export interface TelegramChannelOpts {
 
 export class TelegramChannel implements Channel {
   name = 'telegram';
+
+  private static readonly MEDIA_MARKER_RE =
+    /\[SEND_MEDIA:\s*([^\]|]+?)(?:\s*\|\s*([^\]]*))?\]/g;
+
+  private static readonly IMAGE_EXTS = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp']);
+  private static readonly VIDEO_EXTS = new Set(['.mp4', '.mov', '.avi', '.mkv']);
+  private static readonly MAX_MEDIA_SIZE = 20 * 1024 * 1024; // 20MB
+  private static readonly MAX_CAPTION = 1024; // Telegram caption limit
 
   private bot: Bot | null = null;
   private opts: TelegramChannelOpts;
@@ -97,8 +106,15 @@ export class TelegramChannel implements Channel {
       }
 
       // Store chat metadata for discovery
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, chatName, 'telegram', isGroup);
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        chatName,
+        'telegram',
+        isGroup,
+      );
 
       // Only deliver full message for registered groups
       const group = this.opts.registeredGroups()[chatJid];
@@ -131,7 +147,12 @@ export class TelegramChannel implements Channel {
     const storeNonText = async (
       ctx: any,
       placeholder: string,
-      download?: { fileId: string; label: string; prefix: string; extension: string },
+      download?: {
+        fileId: string;
+        label: string;
+        prefix: string;
+        extension: string;
+      },
     ) => {
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
@@ -164,8 +185,15 @@ export class TelegramChannel implements Channel {
         content = `${placeholder}${caption}`;
       }
 
-      const isGroup = ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
-      this.opts.onChatMetadata(chatJid, timestamp, undefined, 'telegram', isGroup);
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
       this.opts.onMessage(chatJid, {
         id: messageId,
         chat_jid: chatJid,
@@ -194,7 +222,7 @@ export class TelegramChannel implements Channel {
         label: 'Video',
         prefix: 'video',
         extension: '.mp4',
-      })
+      }),
     );
 
     this.bot.on('message:voice', (ctx) =>
@@ -203,7 +231,7 @@ export class TelegramChannel implements Channel {
         label: 'Voice message',
         prefix: 'voice',
         extension: '.ogg',
-      })
+      }),
     );
 
     this.bot.on('message:audio', (ctx) =>
@@ -212,12 +240,14 @@ export class TelegramChannel implements Channel {
         label: 'Audio',
         prefix: 'audio',
         extension: '.mp3',
-      })
+      }),
     );
 
     this.bot.on('message:document', (ctx) => {
       const doc = ctx.message.document!;
-      const name = path.basename(doc.file_name || 'file').replace(/[\x00-\x1f]/g, '');
+      const name = path
+        .basename(doc.file_name || 'file')
+        .replace(/[\x00-\x1f]/g, '');
       const ext = path.extname(name) || '.bin';
       return storeNonText(ctx, `[Document: ${name}]`, {
         fileId: doc.file_id,
@@ -273,23 +303,110 @@ export class TelegramChannel implements Channel {
 
     try {
       const numericId = jid.replace(/^tg:/, '');
+      const groupFolder = this.resolveGroupFolder(jid);
 
-      // Telegram has a 4096 character limit per message — split if needed
-      const MAX_LENGTH = 4096;
-      if (text.length <= MAX_LENGTH) {
-        await this.bot.api.sendMessage(numericId, text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await this.bot.api.sendMessage(
-            numericId,
-            text.slice(i, i + MAX_LENGTH),
-          );
+      // Extract and send media markers
+      // Always strip markers from text to prevent leaking syntax to user
+      const markers = [...text.matchAll(TelegramChannel.MEDIA_MARKER_RE)];
+      const plainText = text.replace(TelegramChannel.MEDIA_MARKER_RE, '').trim();
+
+      if (markers.length > 0 && groupFolder) {
+        // Send plain text first (if any remains after stripping markers)
+        if (plainText) {
+          await this.sendTextChunked(numericId, plainText);
         }
+
+        // Send each media file
+        const groupDir = path.join(GROUPS_DIR, groupFolder);
+        for (const match of markers) {
+          const relativePath = match[1].trim();
+          const caption = match[2]?.trim() || undefined;
+          const fullPath = path.resolve(groupDir, relativePath);
+
+          // Path traversal guard: resolved path must stay inside group workspace
+          if (!fullPath.startsWith(groupDir + path.sep) && fullPath !== groupDir) {
+            logger.warn({ relativePath }, 'SEND_MEDIA path traversal attempt blocked');
+            await this.bot.api.sendMessage(numericId, `Invalid media path`);
+            continue;
+          }
+
+          await this.sendMediaFile(numericId, fullPath, caption);
+        }
+        return;
       }
-      logger.info({ jid, length: text.length }, 'Telegram message sent');
+
+      // No markers or no group folder — send as plain text (markers already stripped)
+      if (markers.length > 0 && !groupFolder) {
+        logger.warn({ jid }, 'SEND_MEDIA markers found but group folder not resolved');
+      }
+      await this.sendTextChunked(numericId, plainText || text);
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
     }
+  }
+
+  private resolveGroupFolder(jid: string): string | null {
+    const groups = this.opts.registeredGroups();
+    const group = groups[jid];
+    return group?.folder ?? null;
+  }
+
+  private async sendMediaFile(
+    chatId: string,
+    filePath: string,
+    caption: string | undefined,
+  ): Promise<boolean> {
+    if (!this.bot) return false;
+
+    let stat: Stats;
+    try {
+      stat = await fs.stat(filePath);
+    } catch {
+      logger.warn({ filePath }, 'Media file not found, skipping');
+      await this.bot.api.sendMessage(chatId, `File not found: ${path.basename(filePath)}`);
+      return false;
+    }
+
+    if (stat.size > TelegramChannel.MAX_MEDIA_SIZE) {
+      logger.warn({ filePath, size: stat.size }, 'Media file too large');
+      await this.bot.api.sendMessage(chatId, `File too large: ${path.basename(filePath)}`);
+      return false;
+    }
+
+    const ext = path.extname(filePath).toLowerCase();
+
+    const safeCaption = caption && caption.length > TelegramChannel.MAX_CAPTION
+      ? caption.slice(0, TelegramChannel.MAX_CAPTION - 3) + '...'
+      : caption;
+
+    if (TelegramChannel.VIDEO_EXTS.has(ext)) {
+      await this.bot.api.sendVideo(chatId, new InputFile(filePath), {
+        caption: safeCaption,
+      });
+    } else if (TelegramChannel.IMAGE_EXTS.has(ext)) {
+      await this.bot.api.sendPhoto(chatId, new InputFile(filePath), {
+        caption: safeCaption,
+      });
+    } else {
+      logger.warn({ filePath, ext }, 'Unsupported media type');
+      await this.bot.api.sendMessage(chatId, `Unsupported file type: ${path.basename(filePath)}`);
+      return false;
+    }
+
+    logger.info({ chatId, filePath, caption: safeCaption }, 'Telegram media sent');
+    return true;
+  }
+
+  private async sendTextChunked(chatId: string, text: string): Promise<void> {
+    const MAX_LENGTH = 4096;
+    if (text.length <= MAX_LENGTH) {
+      await this.bot!.api.sendMessage(chatId, text);
+    } else {
+      for (let i = 0; i < text.length; i += MAX_LENGTH) {
+        await this.bot!.api.sendMessage(chatId, text.slice(i, i + MAX_LENGTH));
+      }
+    }
+    logger.info({ chatId, length: text.length }, 'Telegram message sent');
   }
 
   isConnected(): boolean {
@@ -331,7 +448,10 @@ export class TelegramChannel implements Channel {
       const file = await this.bot.api.getFile(fileId);
 
       if (file.file_size && file.file_size > 20 * 1024 * 1024) {
-        logger.warn({ fileId, size: file.file_size }, 'Telegram file exceeds 20MB limit');
+        logger.warn(
+          { fileId, size: file.file_size },
+          'Telegram file exceeds 20MB limit',
+        );
         return null;
       }
 
@@ -344,7 +464,10 @@ export class TelegramChannel implements Channel {
       const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
       const response = await fetch(url);
       if (!response.ok) {
-        logger.warn({ fileId, status: response.status }, 'Telegram file download failed');
+        logger.warn(
+          { fileId, status: response.status },
+          'Telegram file download failed',
+        );
         return null;
       }
 
