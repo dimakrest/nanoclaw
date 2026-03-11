@@ -45,7 +45,8 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
+import { generateDmFolderName } from './auto-register.js';
+import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -132,55 +133,6 @@ export function getAvailableGroups(): import('./container-runner.js').AvailableG
       lastActivity: c.last_message_time,
       isRegistered: registeredJids.has(c.jid),
     }));
-}
-
-/**
- * Generate a valid group folder name from a DM JID and optional contact name.
- * Prefers the contact's push name, falls back to a JID-derived slug.
- * Handles collisions by appending -2, -3, etc.
- * Returns null if no valid folder name can be generated.
- */
-export function generateDmFolderName(
-  chatJid: string,
-  contactName?: string,
-): string | null {
-  const usedFolders = new Set(
-    Object.values(registeredGroups).map((g) => g.folder),
-  );
-
-  let base: string | undefined;
-  if (contactName) {
-    base =
-      contactName
-        .toLowerCase()
-        .replace(/[^a-z0-9]+/g, '-')
-        .replace(/^-+|-+$/g, '')
-        .slice(0, 50) || undefined;
-  }
-
-  if (!base) {
-    const atIdx = chatJid.indexOf('@');
-    if (atIdx !== -1) {
-      base = `wa-${chatJid.slice(0, atIdx)}`;
-    } else {
-      base = `dm-${chatJid.slice(0, 20)}`;
-    }
-  }
-
-  if (!/^[A-Za-z0-9]/.test(base)) base = `dm-${base}`;
-  base = base.slice(0, 60);
-
-  let candidate = base;
-  let counter = 2;
-  while (usedFolders.has(candidate)) {
-    if (counter > 1000) return null;
-    candidate = `${base}-${counter}`;
-    counter++;
-  }
-
-  if (!isValidGroupFolder(candidate)) return null;
-
-  return candidate;
 }
 
 /** @internal - exported for testing */
@@ -573,7 +525,10 @@ async function main(): Promise<void> {
     ): boolean => {
       if (!AUTO_REGISTER_DMS) return false;
 
-      const folder = generateDmFolderName(chatJid, meta.name);
+      const usedFolders = new Set(
+        Object.values(registeredGroups).map((g) => g.folder),
+      );
+      const folder = generateDmFolderName(chatJid, usedFolders, meta.name);
       if (!folder) {
         logger.warn(
           { chatJid, name: meta.name },
