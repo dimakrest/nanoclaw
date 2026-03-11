@@ -1,0 +1,18 @@
+skill: add-auto-register-dm
+version: 1.0.0
+description: "Auto-register DM users on first message for instant interaction"
+core_version: 0.1.0
+adds:
+  - src/auto-register.ts
+  - src/auto-register.test.ts
+modifies:
+  - src/types.ts
+  - src/channels/registry.ts
+  - src/config.ts
+  - src/index.ts
+structured:
+  env_additions:
+    - AUTO_REGISTER_DMS=false
+conflicts: []
+depends: []
+test: "npx vitest run src/auto-register.test.ts"
