@@ -3,7 +3,9 @@ import path from 'path';
 
 import {
   ASSISTANT_NAME,
+  AUTO_REGISTER_DMS,
   CREDENTIAL_PROXY_PORT,
+  GROUPS_DIR,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
   TIMEZONE,
@@ -43,6 +45,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
+import { generateDmFolderName } from './auto-register.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
@@ -573,6 +576,57 @@ async function main(): Promise<void> {
       channel?: string,
       isGroup?: boolean,
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
+    onUnregisteredDm: (
+      chatJid: string,
+      meta: { name?: string; channel?: string },
+    ): boolean => {
+      if (!AUTO_REGISTER_DMS) return false;
+
+      const usedFolders = new Set(
+        Object.values(registeredGroups).map((g) => g.folder),
+      );
+      const folder = generateDmFolderName(chatJid, usedFolders, meta.name);
+      if (!folder) {
+        logger.warn(
+          { chatJid, name: meta.name },
+          'Could not generate valid folder for DM user',
+        );
+        return false;
+      }
+
+      const displayName = meta.name || folder;
+
+      logger.info(
+        { chatJid, folder, name: displayName },
+        'Auto-registering DM user',
+      );
+
+      registerGroup(chatJid, {
+        name: displayName,
+        folder,
+        trigger: '',
+        added_at: new Date().toISOString(),
+        requiresTrigger: false,
+      });
+
+      // Copy global CLAUDE.md as the initial per-user memory
+      const globalClaudeMd = path.join(GROUPS_DIR, 'global', 'CLAUDE.md');
+      const userClaudeMd = path.join(GROUPS_DIR, folder, 'CLAUDE.md');
+      try {
+        fs.copyFileSync(
+          globalClaudeMd,
+          userClaudeMd,
+          fs.constants.COPYFILE_EXCL,
+        );
+      } catch (err: unknown) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'EEXIST') {
+          logger.warn({ err, folder }, 'Failed to copy global CLAUDE.md');
+        }
+      }
+
+      return true;
+    },
     registeredGroups: () => registeredGroups,
   };
 

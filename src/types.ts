@@ -105,3 +105,15 @@ export type OnChatMetadata = (
   channel?: string,
   isGroup?: boolean,
 ) => void;
+
+/**
+ * Callback for channels to report a DM from an unregistered JID.
+ * The orchestrator decides whether to auto-register.
+ * Only handles registration — does NOT store the message.
+ * If it returns true, the channel should re-check registeredGroups()
+ * and deliver the message via the normal onMessage path.
+ */
+export type OnUnregisteredDm = (
+  chatJid: string,
+  meta: { name?: string; channel?: string },
+) => boolean;
